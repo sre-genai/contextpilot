@@ -579,7 +579,11 @@ const RTK_TEST_COMMANDS: [&str; 5] = ["cargo test", "npm test", "yarn test", "py
 fn route_to_rtk(command: &str) -> Option<String> {
     let trimmed = command.trim_start();
     let first = trimmed.split_whitespace().next()?;
-    if first == "rtk" {
+    // A prefix only reaches the first command of a list, so `rtk npm i && npm test` would
+    // filter the install and leave the test raw. Route whole commands or nothing.
+    if first == "rtk" || trimmed.contains("&&") || trimmed.contains("||")
+        || trimmed.contains(';') || trimmed.contains('|')
+    {
         return None;
     }
     if RTK_TEST_COMMANDS.iter().any(|c| trimmed.starts_with(c)) {
@@ -1239,7 +1243,17 @@ mod tests {
         assert_eq!(route_to_rtk("pytest -x").unwrap(), "rtk test pytest -x");
         assert_eq!(route_to_rtk("kubectl logs api").unwrap(), "rtk kubectl logs api");
         assert_eq!(route_to_rtk("  git status").unwrap(), "rtk git status");
-        for untouched in ["rtk git status", "terraform plan", "cd src && cargo test", "./run.sh"] {
+        for untouched in [
+            "rtk git status",
+            "terraform plan",
+            "cd src && cargo test",
+            "./run.sh",
+            // Known first word, but a list: routing would filter only the first part.
+            "npm init -y && npm i express",
+            "git status; ls",
+            "cargo build || echo failed",
+            "ls -la | head",
+        ] {
             assert!(route_to_rtk(untouched).is_none(), "{untouched}");
         }
     }

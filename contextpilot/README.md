@@ -86,9 +86,14 @@ redaction, the budget and the cache. Measured here with `cl100k_base`:
 | `git status` | 58 | 58 | 18 | 18 |
 | `ls -laR` | 424,987 | 710 | 292 | 292 |
 
-Only the first word of a command is considered, so compound commands like
-`cd src && cargo test` are left alone rather than quietly changing meaning. Commands RTK has no
-filter for, such as `terraform plan`, take the character-budget path instead.
+Routing applies to a single command only. A prefix reaches just the first command of a list,
+so `npm i && npm test` would filter the install and leave the test raw; anything containing
+`&&`, `||`, `;` or a pipe is left alone instead. Commands RTK has no filter for, such as
+`terraform plan`, take the character-budget path.
+
+Because RTK runs first, its reduction lands before `stats` measures anything, so on a session
+of well-filtered commands this tool reports a small saving next to RTK's large one. `rtk gain`
+reports that half.
 
 Do not run `rtk init`: it installs its own `PreToolUse` hook, and two hooks rewriting the same
 command would nest. Installing the binary is enough.
