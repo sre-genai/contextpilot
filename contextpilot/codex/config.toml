@@ -1,0 +1,21 @@
+# Append to ~/.codex/config.toml (or .codex/config.toml in a trusted project).
+# Codex reports shell calls as tool_name "Bash" with a string command, so the
+# same hook binary serves both runtimes. scripts/install.sh writes the absolute
+# bootstrap path below, since Codex has no plugin-root variable to expand.
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'CONTEXTPILOT_BOOTSTRAP'
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'command -v contextpilot >/dev/null 2>&1 && contextpilot hook || true'
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'command -v contextpilot >/dev/null 2>&1 && contextpilot hook || true'
+statusMessage = "Routing command output through ContextPilot"

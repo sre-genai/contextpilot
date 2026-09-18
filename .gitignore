@@ -1,0 +1,8 @@
+# Generated indexes and caches
+/.contextpilot/
+/.code-review-graph/
+
+# Skills installed into this checkout by other tools
+/.claude/
+/.agents/
+/skills-lock.json

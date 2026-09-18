@@ -1,0 +1,13 @@
+{
+  "name": "contextpilot",
+  "owner": { "name": "ContextPilot" },
+  "plugins": [
+    {
+      "name": "contextpilot",
+      "source": "./contextpilot",
+      "displayName": "ContextPilot",
+      "version": "0.1.0",
+      "description": "Redacts secrets and shrinks oversized command output before it reaches the model, caching the full text for retrieval."
+    }
+  ]
+}
