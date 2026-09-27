@@ -146,8 +146,14 @@ fn classify(s: &str) -> Policy {
     if task.is_empty() {
         task.push(Task::Question);
     }
+    // "find out what is actually wrong" is debugging, not a question: the phrasing of a
+    // failure report must not earn the discount meant for "what is this function".
+    let investigating = task
+        .iter()
+        .any(|t| matches!(t, Task::Debug | Task::DevOps));
     let mut score: i32 = SCORE_SIGNALS
         .iter()
+        .filter(|(weight, _)| *weight > 0 || !investigating)
         .map(|(weight, words)| weight * words.iter().filter(|w| l.contains(*w)).count() as i32)
         .sum();
     if s.len() > 1500 {
@@ -218,6 +224,32 @@ fn redact(s: &str) -> String {
         Regex::new(p).unwrap().replace_all(&acc, *r).into_owned()
     })
 }
+/// Strip what a terminal renders but a reader never needs: colour codes, the overwritten
+/// part of a progress line, and runs of an identical line. All three are pure volume, and
+/// the full text stays recoverable from the cache either way.
+fn denoise(s: &str) -> String {
+    let ansi = Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").unwrap();
+    let mut out: Vec<String> = Vec::new();
+    let mut repeats = 0usize;
+    for line in ansi.replace_all(s, "").lines() {
+        // A carriage return means the terminal drew over what came before it.
+        let line = line.rsplit('\r').next().unwrap_or(line).trim_end();
+        match out.last() {
+            Some(previous) if previous == line && !line.is_empty() => repeats += 1,
+            _ => {
+                if repeats > 0 {
+                    out.push(format!("... [previous line repeated {repeats} times] ..."));
+                    repeats = 0;
+                }
+                out.push(line.to_owned());
+            }
+        }
+    }
+    if repeats > 0 {
+        out.push(format!("... [previous line repeated {repeats} times] ..."));
+    }
+    out.join("\n")
+}
 fn limit(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -244,34 +276,85 @@ fn compress(s: &str, radius: usize, max: usize) -> String {
     }
     let important =
         Regex::new(r"(?i)error|exception|fatal|failed|timeout|denied|panic|warn").unwrap();
-    let mut keep = vec![false; lines.len()];
-    for (i, line) in lines.iter().enumerate() {
-        if i < 20 || i >= lines.len().saturating_sub(20) || important.is_match(line) {
-            let start = i.saturating_sub(radius);
-            let end = i.saturating_add(radius).saturating_add(1).min(lines.len());
-            keep[start..end].fill(true);
-        }
-    }
-    let mut out = Vec::new();
-    let mut gap = false;
-    for (i, line) in lines.iter().enumerate() {
-        if keep[i] {
-            if gap {
-                out.push("... [omitted] ...");
-            }
-            out.push(line);
-            gap = false;
-        } else {
-            gap = true;
-        }
-    }
-    let selected = out.join("\n");
-    let candidate = if selected.len() < s.len() {
-        &selected
-    } else {
-        s
+    let mark = |keep: &mut [bool], i: usize| {
+        let start = i.saturating_sub(radius);
+        let end = i.saturating_add(radius).saturating_add(1).min(lines.len());
+        keep[start..end].fill(true);
     };
-    limit(candidate, max)
+    let render = |keep: &[bool]| {
+        let mut out = Vec::new();
+        let mut gap = false;
+        for (i, line) in lines.iter().enumerate() {
+            if keep[i] {
+                if gap {
+                    out.push("... [omitted] ...");
+                }
+                out.push(line);
+                gap = false;
+            } else {
+                gap = true;
+            }
+        }
+        out.join("\n")
+    };
+    let mut failures = vec![false; lines.len()];
+    for (i, line) in lines.iter().enumerate() {
+        if important.is_match(line) {
+            mark(&mut failures, i);
+        }
+    }
+    // Two knobs compete for one budget: how much context each failure keeps, and how much
+    // of the run's own framing survives. The opening lines are the baseline a later
+    // slowdown is only readable against, so neither can simply win. Widen both as far as
+    // the budget allows, failure context first.
+    let has_failures = failures.iter().any(|k| *k);
+    let mut contexts: Vec<usize> = [radius, radius / 2, radius / 4, 2, 1, 0]
+        .into_iter()
+        .filter(|c| *c <= radius)
+        .collect();
+    contexts.dedup();
+    for context in contexts {
+        let mut marked = vec![false; lines.len()];
+        for (i, line) in lines.iter().enumerate() {
+            if important.is_match(line) {
+                let start = i.saturating_sub(context);
+                let end = i.saturating_add(context).saturating_add(1).min(lines.len());
+                marked[start..end].fill(true);
+            }
+        }
+        // Edge lines need no context of their own; they are already an edge of the log.
+        for ends in [20usize, 10, 5, 2, 1, 0] {
+            if ends == 0 && !has_failures {
+                continue;
+            }
+            let mut keep = marked.clone();
+            for i in (0..ends).chain(lines.len().saturating_sub(ends)..lines.len()) {
+                keep[i] = true;
+            }
+            let rendered = render(&keep);
+            if rendered.chars().count() <= max {
+                return if rendered.len() < s.len() {
+                    rendered
+                } else {
+                    limit(s, max)
+                };
+            }
+        }
+        if !has_failures {
+            break;
+        }
+    }
+    // More failure lines than the budget holds: keep the earliest, which explain the rest.
+    if has_failures {
+        let mut only = vec![false; lines.len()];
+        for (i, line) in lines.iter().enumerate() {
+            if important.is_match(line) {
+                only[i] = true;
+            }
+        }
+        return render(&only).chars().take(max).collect();
+    }
+    limit(s, max)
 }
 fn cache_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -572,7 +655,10 @@ const RTK_COMMANDS: [&str; 33] = [
     "bunx", "curl",
 ];
 /// Test runners route through `rtk test`, which reports failures only.
-const RTK_TEST_COMMANDS: [&str; 5] = ["cargo test", "npm test", "yarn test", "pytest", "go test"];
+const RTK_TEST_COMMANDS: [&str; 12] = [
+    "cargo test", "npm test", "yarn test", "pnpm test", "pytest", "go test", "python -m pytest",
+    "python3 -m pytest", "poetry run pytest", "uv run pytest", "npx jest", "npx vitest",
+];
 /// Rewrite a command to run under RTK when RTK has a filter for it. Only the first word is
 /// considered, so compound commands (`cd x && cargo test`) are left alone rather than
 /// silently changing meaning.
@@ -584,6 +670,15 @@ fn route_to_rtk(command: &str) -> Option<String> {
     if first == "rtk" || trimmed.contains("&&") || trimmed.contains("||")
         || trimmed.contains(';') || trimmed.contains('|')
     {
+        return None;
+    }
+    // A filter rewrites the shape of the output, not just its size. When the output is
+    // being captured to a file something else will read, leave the original format alone.
+    // `2>&1` only moves a stream and is fine.
+    let bytes = trimmed.as_bytes();
+    if bytes.iter().enumerate().any(|(i, b)| {
+        *b == b'>' && bytes[i + 1..].iter().find(|c| **c != b' ').is_some_and(|c| *c != b'&')
+    }) {
         return None;
     }
     if RTK_TEST_COMMANDS.iter().any(|c| trimmed.starts_with(c)) {
@@ -878,14 +973,20 @@ fn summarize(s: &str) -> String {
     out.join("\n")
 }
 #[derive(Serialize)]
-struct Processed {
-    policy: Policy,
+struct Processed<'a> {
+    policy: &'a Policy,
     budget_unit: &'static str,
+    summary: Option<&'a str>,
+    output: &'a str,
+    cache_ref: Option<&'a str>,
+}
+struct Outcome {
+    policy: Policy,
     summary: Option<String>,
     output: String,
     cache_ref: Option<String>,
 }
-fn process(prompt: &str, input: &str, root: &Path) -> Result<Processed> {
+fn process(prompt: &str, input: &str, root: &Path) -> Result<Outcome> {
     let started = std::time::Instant::now();
     if prompt.trim().is_empty() {
         bail!("Prompt cannot be empty");
@@ -897,16 +998,36 @@ fn process(prompt: &str, input: &str, root: &Path) -> Result<Processed> {
     // Compression is decided by the size of the result, not by the prompt: output that
     // already fits is never compressed, because compression can only lose information.
     let oversized = clean.chars().count() > budget;
+    // Denoise only what the model will read; the cache keeps the redacted original.
+    let readable = if oversized { denoise(&clean) } else { clean.clone() };
     let output = if policy.caveman && oversized {
-        compress(&clean, 20, budget)
+        compress(&readable, 20, budget)
     } else {
-        limit(&clean, budget)
+        limit(&readable, budget)
     };
-    let (summary, cache_ref) = if output != clean {
+    let (mut summary, mut cache_ref) = if output != clean {
         (Some(summarize(&clean)), Some(cache(root, &clean)?))
     } else {
         (None, None)
     };
+    // Output a little over budget can cost more to wrap than the trim saves: the policy,
+    // the summary and JSON escaping all have to be paid for. When that happens, send the
+    // whole redacted text instead, which is both smaller and complete.
+    let mut output = output;
+    if cache_ref.is_some() {
+        let wrapped = serde_json::to_string(&Processed {
+            policy: &policy,
+            budget_unit: "characters",
+            summary: summary.as_deref(),
+            output: &output,
+            cache_ref: cache_ref.as_deref(),
+        })?;
+        if wrapped.chars().count() >= clean.chars().count() {
+            output = clean.clone();
+            summary = None;
+            cache_ref = None;
+        }
+    }
     record(
         root,
         &Run {
@@ -921,9 +1042,8 @@ fn process(prompt: &str, input: &str, root: &Path) -> Result<Processed> {
             ms: started.elapsed().as_millis() as u64,
         },
     )?;
-    Ok(Processed {
+    Ok(Outcome {
         policy,
-        budget_unit: "characters",
         summary,
         output,
         cache_ref,
@@ -957,7 +1077,16 @@ fn main() -> Result<()> {
         Command::Process { prompt, root } => {
             let result = process(&prompt, &read_stdin()?, &root.unwrap_or_else(cache_dir))?;
             if result.cache_ref.is_some() {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&Processed {
+                        policy: &result.policy,
+                        budget_unit: "characters",
+                        summary: result.summary.as_deref(),
+                        output: &result.output,
+                        cache_ref: result.cache_ref.as_deref(),
+                    })?
+                );
             } else {
                 print!("{}", result.output);
             }
@@ -1042,6 +1171,22 @@ mod tests {
             16000,
         );
         assert!(no_errors.ends_with("SUCCESS: complete"));
+    }
+    #[test]
+    fn a_tight_budget_keeps_the_failure_not_the_boilerplate() {
+        let mut lines = vec!["INFO worker ok batch done".to_string(); 4000];
+        lines[0] = "START banner".into();
+        lines[2500] = "ERROR db-pool: connection timeout after 30s".into();
+        *lines.last_mut().unwrap() = "END banner".into();
+        let log = lines.join("\n");
+        for budget in [600, 1200, 4000] {
+            let out = compress(&log, 20, budget);
+            assert!(out.chars().count() <= budget);
+            assert!(
+                out.contains("ERROR db-pool"),
+                "budget {budget} dropped the only failure in the log"
+            );
+        }
     }
     #[test]
     fn compression_bounds_long_lines_and_repeated_warnings() {
@@ -1232,6 +1377,12 @@ mod tests {
         assert_eq!(refactor.task, vec![Task::Refactor, Task::Architecture]);
         assert!(refactor.codegraph, "cross-service refactor needs the graph");
 
+        // A failure report phrased as a question is still a failure report.
+        let ci = classify("noisy.sh is failing in CI, find out what is actually wrong");
+        assert_eq!(ci.complexity, "normal", "debugging must not take the question discount");
+        assert!(ci.caveman, "a debug budget must keep error context, not just head and tail");
+        assert_eq!(classify("what is this function").complexity, "lite");
+
         // Redaction is unconditional: no prompt may switch it off.
         for prompt in ["explain this", "rename x", "investigate the outage"] {
             assert!(classify(prompt).secret_guard);
@@ -1243,6 +1394,8 @@ mod tests {
         assert_eq!(route_to_rtk("pytest -x").unwrap(), "rtk test pytest -x");
         assert_eq!(route_to_rtk("kubectl logs api").unwrap(), "rtk kubectl logs api");
         assert_eq!(route_to_rtk("  git status").unwrap(), "rtk git status");
+        // Redirecting only stderr changes no format and still routes.
+        assert_eq!(route_to_rtk("cargo build 2>&1").unwrap(), "rtk cargo build 2>&1");
         for untouched in [
             "rtk git status",
             "terraform plan",
@@ -1250,6 +1403,9 @@ mod tests {
             "./run.sh",
             // Known first word, but a list: routing would filter only the first part.
             "npm init -y && npm i express",
+            // Captured output must keep the shape the reader expects.
+            "ls -la > listing.txt",
+            "cargo build > build.log",
             "git status; ls",
             "cargo build || echo failed",
             "ls -la | head",
@@ -1347,6 +1503,52 @@ mod tests {
         let facts = graph_context("why does login fail", temp.0.to_str().unwrap()).unwrap();
         assert!(facts.contains("login: called by []; uses [helper]"), "{facts}");
         assert!(graph_context("unrelated words only", temp.0.to_str().unwrap()).is_none());
+    }
+    #[test]
+    fn wrapping_never_costs_more_than_it_saves() {
+        let temp = Temp::new();
+        // Just over the lite budget, and every line distinct, so nothing collapses:
+        // trimming saves little and the wrapper costs a lot. Source code looks like this.
+        let source: String = (0..38)
+            .map(|i| format!("const value{i} = compute({i}, \"row {i}\");\n"))
+            .collect();
+        let result = process("explain this file", &source, &temp.0).unwrap();
+        let size = source.chars().count();
+        let budget = result.policy.output_budget;
+        assert!(
+            size > budget && size < budget + 600,
+            "fixture must sit just over budget, where wrapping cannot pay: {size} vs {budget}"
+        );
+        assert!(
+            result.cache_ref.is_none(),
+            "a wrapper larger than the text it wraps must not be sent"
+        );
+        assert_eq!(result.output, redact(&source), "full text, not a trimmed one");
+        // Far over budget, wrapping still pays for itself.
+        let big = process("explain this file", &"log line\n".repeat(9000), &temp.0).unwrap();
+        assert!(big.cache_ref.is_some());
+    }
+    #[test]
+    fn denoising_drops_volume_not_meaning() {
+        let progress = "\x1b[32mdownloading\x1b[0m 10%\rdownloading 60%\rdownloading 100%";
+        assert_eq!(denoise(progress), "downloading 100%");
+
+        let repeated = format!("{}ERROR disk full\n{}", "retrying\n".repeat(500), "retrying\n".repeat(3));
+        let out = denoise(&repeated);
+        assert!(out.contains("ERROR disk full"), "a failure must survive collapsing");
+        assert!(out.contains("repeated 499 times"), "{out}");
+        assert!(out.lines().count() < 10, "{} lines left", out.lines().count());
+
+        // Distinct lines are never merged, and a run of blanks is left alone.
+        let distinct = "alpha\nbeta\ngamma";
+        assert_eq!(denoise(distinct), distinct);
+        assert_eq!(denoise("a\n\n\nb").lines().count(), 4);
+    }
+    #[test]
+    fn python_runners_route_to_the_filter() {
+        for cmd in ["python -m pytest", "python3 -m pytest tests/", "poetry run pytest -x", "uv run pytest"] {
+            assert!(route_to_rtk(cmd).is_some_and(|r| r.starts_with("rtk test ")), "{cmd}");
+        }
     }
     #[test]
     fn cli_rejects_invalid_budgets() {
