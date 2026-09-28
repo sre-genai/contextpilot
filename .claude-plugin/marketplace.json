@@ -1,6 +1,8 @@
 {
   "name": "contextpilot",
-  "owner": { "name": "ContextPilot" },
+  "owner": {
+    "name": "ContextPilot"
+  },
   "plugins": [
     {
       "name": "contextpilot",
@@ -8,6 +10,23 @@
       "displayName": "ContextPilot",
       "version": "0.1.0",
       "description": "Redacts secrets and shrinks oversized command output before it reaches the model, caching the full text for retrieval."
+    },
+    {
+      "name": "contextpilot-full",
+      "source": "./bundle",
+      "displayName": "ContextPilot (with companions)",
+      "version": "0.1.0",
+      "description": "ContextPilot plus the companion plugins it routes to. Installing this pulls in both.",
+      "dependencies": [
+        "contextpilot",
+        {
+          "name": "ponytail",
+          "marketplace": "ponytail"
+        }
+      ]
     }
+  ],
+  "allowCrossMarketplaceDependenciesOn": [
+    "ponytail"
   ]
 }

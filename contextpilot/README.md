@@ -11,18 +11,23 @@ cargo build --release
 
 Optionally copy the release binary to a directory on your PATH.
 
-## What installing this brings
+## Installing
 
-Installing ContextPilot installs its companions too. On the first session, `SessionStart` runs
-`scripts/bootstrap.sh`, which builds this plugin's binary with `cargo` when no copy is on
-`PATH`, indexes the current project when it has no index yet, and installs whichever of RTK,
-ponytail and caveman are missing. Hooks resolve the binary from the plugin data directory, a
-bundled `bin/`, then `PATH`.
+```bash
+claude plugin marketplace add sre-genai/contextpilot
+claude plugin install contextpilot@contextpilot
+claude plugin list        # must report enabled, not merely installed
+```
 
-Everything past the binary runs in the background, logged to `install.log` in the data
-directory, because building RTK from source takes minutes and a session must not wait on it.
-The first session reports what it started as a `systemMessage`, so the notice reaches the
-terminal rather than the model's context.
+For Codex, or to put the binary on `PATH`, clone the repository and run
+`contextpilot/scripts/install.sh`. It builds the release binary and appends the hook block to
+`$CODEX_HOME/config.toml`, backing up any existing file first.
+
+On the first session, `SessionStart` runs `scripts/bootstrap.sh`, which builds this plugin's
+binary with `cargo` when no copy is on `PATH` and indexes the current project. Hooks resolve
+the binary from the plugin data directory, a bundled `bin/`, then `PATH`, and do nothing at all
+if none of the three holds a copy, so a partial install degrades to no behaviour change rather
+than to failing commands.
 
 Running the script repeatedly, or in several sessions at once, does the work once:
 
@@ -30,16 +35,55 @@ Running the script repeatedly, or in several sessions at once, does the work onc
 |---|---|
 | Build the binary | Skipped when a binary is already on `PATH` or in the data directory |
 | Index the project | Skipped when `.contextpilot/graph.json` exists; the index is written to a staging file and renamed, so a reader never sees half of one and two indexers racing leave one whole file |
-| Install a companion | Skipped when it is present, when its installer is absent, or when it was attempted before. Delete `attempted-<name>` in the data directory to ask again |
+| Name what is missing | Reported once per installation, then never again |
 | Concurrent sessions | Each step is claimed with `mkdir`, which is atomic; a session that loses the race skips that step rather than duplicating it |
 
-Set `CONTEXTPILOT_NO_AUTOINSTALL=1` to install nothing but this plugin's own binary. Each
-companion stays optional at runtime: no RTK means the character-budget path, no style plugin
-means a self-contained profile, no index means no dependency facts.
+## Companions, and why they are not installed for you
 
-Installing this plugin therefore fetches software from three other projects, one of them by
-running `npx` against a GitHub repository. That is a supply chain your users inherit from this
-plugin, and the opt-out above is the only thing that prevents it.
+Three other projects make this tool better, and none of them are installed on your behalf.
+They are other people's software, and deciding to run it belongs to whoever owns the machine.
+The first session names whichever are missing, once, as a `systemMessage` so the notice reaches
+the terminal rather than the model's context.
+
+| Companion | What it adds | Install |
+|---|---|---|
+| [RTK](https://github.com/rtk-ai/rtk) | Per-command output filters: it knows what `cargo test` means, where a character budget only knows how long it is | `cargo install --git https://github.com/rtk-ai/rtk --tag v0.50.0 --locked` |
+| ponytail | A leaner solution for the task the classifier just sized | `claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail` |
+| caveman | Terser replies, which is the one pool of tokens this tool cannot reach | `npx skills add https://github.com/juliusbrussee/caveman --skill caveman` |
+
+To take the two that can be pinned and audited in one step:
+
+```bash
+claude plugin install contextpilot-full@contextpilot
+```
+
+That bundle is a manifest of dependencies and nothing else, so the plugin manager resolves and
+installs them under its own rules rather than a shell script of ours. caveman is deliberately
+absent from it: installing that one means running a fetched npm package, which stays a command
+you type rather than one this plugin runs for you.
+
+`CONTEXTPILOT_AUTOINSTALL=1` restores automatic installation of RTK, pinned to the release
+above, and ponytail. It is off by default.
+
+Each companion stays optional at runtime. No RTK means the character-budget path, no style
+plugin means a self-contained behaviour profile, no index means no dependency facts. Nothing
+degrades into an error.
+
+## What the hooks do to your commands
+
+This plugin rewrites shell commands, which is worth stating plainly rather than leaving to be
+discovered:
+
+- `UserPromptSubmit` reads your prompt, classifies it, and adds one short line of context.
+- `PreToolUse` rewrites every Bash command so its output is captured to a temporary file and
+  passed through `process` before the model reads it. Working directory changes and exit
+  status are preserved; commands containing `exit` or `exec`, backgrounded commands, command
+  lists, and commands redirecting to a file are left untouched.
+- `SessionStart` builds the binary and indexes the project.
+
+Nothing leaves the machine. There are no network calls, no model calls, and no telemetry
+beyond a local file you can read with `contextpilot stats`. Disable everything with
+`claude plugin disable contextpilot`.
 
 ## Routing to style plugins
 
@@ -98,38 +142,15 @@ reports that half.
 Do not run `rtk init`: it installs its own `PreToolUse` hook, and two hooks rewriting the same
 command would nest. Installing the binary is enough.
 
-## Use as a plugin
+## How the rewrite works
 
 The same binary serves Claude Code and Codex: both report shell calls as `tool_name: "Bash"`
-with a string `command`, and both accept `updatedInput` from a `PreToolUse` hook.
+with a string `command`, and both accept `updatedInput` from a `PreToolUse` hook. Reduction
+therefore happens before the model sees anything, which `PostToolUse` cannot do in Claude
+Code: that event can only append context.
 
-```bash
-./scripts/install.sh
-```
-
-That builds the release binary, places it in `bin/` and on `PATH`, and appends the Codex hook
-block to `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), backing up any existing
-file and skipping the append when the hooks are already registered.
-
-For Claude Code, install from the marketplace defined at the repository root:
-
-```bash
-claude plugin marketplace add ./path/to/repository
-claude plugin install contextpilot@contextpilot
-```
-
-`claude --plugin-dir ./contextpilot` loads it for a single session instead. The hooks resolve
-the binary from the plugin directory first and `PATH` second, and do nothing if neither exists,
-so a partial install degrades to no behavior change rather than to failing commands. Disable
-with `claude plugin disable contextpilot`.
-
-Two hooks do the work. `UserPromptSubmit` stashes the current task text under the session id in
-the temporary directory; `PreToolUse` rewrites each Bash command to capture its combined output
-to a temporary file and feed that through `process`, using the stashed task for classification.
-Output reduction therefore happens before the model sees anything, which `PostToolUse` cannot
-do in Claude Code: that event can only append context.
-
-The rewrite preserves working-directory changes and exit status:
+`UserPromptSubmit` stashes the task text under the session id; `PreToolUse` rewrites the
+command around it:
 
 ```bash
 __cp_out=$(mktemp); {
@@ -138,9 +159,7 @@ __cp_out=$(mktemp); {
 ```
 
 The brace group runs in the calling shell, so `cd` still persists, and `(exit N)` restores the
-status without terminating that shell. Commands containing `exit` or `exec`, backgrounded
-commands, and commands already mentioning `contextpilot` are left untouched, because their
-output cannot be captured this way. Rewriting merges stderr into stdout.
+status without terminating that shell. Rewriting merges stderr into stdout.
 
 ## Execution policy
 

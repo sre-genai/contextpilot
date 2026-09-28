@@ -1,0 +1,8 @@
+{
+  "name": "contextpilot-full",
+  "displayName": "ContextPilot (with companions)",
+  "version": "0.1.0",
+  "description": "Installs ContextPilot together with the companion plugins its classifier routes to.",
+  "license": "MIT",
+  "dependencies": ["contextpilot"]
+}
