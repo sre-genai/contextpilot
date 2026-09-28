@@ -1,0 +1,7 @@
+#!/bin/sh
+# Refuse to publish credentials. Enabled by: git config core.hooksPath .githooks
+# Bypass for a known-good push with: git push --no-verify
+set -eu
+root=$(git rev-parse --show-toplevel)
+echo "scanning for credentials before push..."
+sh "$root/contextpilot/scripts/scan-secrets.sh" --history

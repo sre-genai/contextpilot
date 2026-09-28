@@ -199,6 +199,13 @@ fn read_stdin() -> Result<String> {
     io::stdin().read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
+/// Values that name a type rather than hold one. `apiKey: string` is a declaration, and
+/// redacting it corrupts the source a reader came for.
+const TYPE_WORDS: [&str; 26] = [
+    "string", "str", "usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32",
+    "i64", "f32", "f64", "number", "boolean", "bool", "int", "integer", "float", "double",
+    "char", "byte", "object", "any",
+];
 fn redact(s: &str) -> String {
     let patterns = [
         (r"glpat-[A-Za-z0-9_-]{12,}", "[GITLAB_TOKEN]"),
@@ -211,18 +218,53 @@ fn redact(s: &str) -> String {
             r"(?s)-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z]+ )?PRIVATE KEY-----",
             "[PRIVATE_KEY]",
         ),
-        (
-            r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+",
-            "$1 [REDACTED]",
-        ),
-        (
-            r#"(?i)([\w.-]*(?:password|passwd|pwd|secret|token|credentials?|(?:api|access|secret|private|signing|encryption|auth)[_-]?key)\b["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)"#,
-            "${1}[REDACTED]",
-        ),
     ];
-    patterns.iter().fold(s.to_owned(), |acc, (p, r)| {
+    let out = patterns.iter().fold(s.to_owned(), |acc, (p, r)| {
         Regex::new(p).unwrap().replace_all(&acc, *r).into_owned()
-    })
+    });
+
+    // A credential after Bearer/Basic always carries a digit or punctuation; requiring one
+    // keeps the word "basic" in ordinary prose from being read as an Authorization header.
+    let auth = Regex::new(r"(?i)\b(Bearer|Basic)\s+([A-Za-z0-9._~+/=-]+)").unwrap();
+    let out = auth
+        .replace_all(&out, |caps: &regex::Captures| {
+            let token = &caps[2];
+            let credential_shaped = token.len() >= 8
+                && token
+                    .chars()
+                    .any(|c| c.is_ascii_digit() || "._~+/=-".contains(c));
+            match credential_shaped {
+                true => format!("{} [REDACTED]", &caps[1]),
+                false => caps[0].to_owned(),
+            }
+        })
+        .into_owned();
+
+    let assignment = Regex::new(
+        r#"(?i)([\w.-]*(?:password|passwd|pwd|secret|token|credentials?|(?:api|access|secret|private|signing|encryption|auth)[_-]?key)\b["']?\s*[=:]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)"#,
+    )
+    .unwrap();
+    assignment
+        .replace_all(&out, |caps: &regex::Captures| {
+            let value = caps[2].to_ascii_lowercase();
+            // Markup around a type still names a type: `apiKey: string` in prose.
+            let bare = value.trim_matches(|c: char| "`\"'*_,.;:".contains(c));
+            // A borrow or a call is code rather than a stored value, as in
+            // `let token` assigned from `&caps[2]`.
+            let expression = bare.starts_with('&')
+                || bare.starts_with("self.")
+                || bare.contains('(')
+                || bare.contains('[');
+            let declared_type = TYPE_WORDS.contains(&bare)
+                || bare.starts_with("option")
+                || bare.starts_with("vec")
+                || matches!(bare, "null" | "none" | "true" | "false" | "unknown");
+            match declared_type || expression {
+                true => caps[0].to_owned(),
+                false => format!("{}[REDACTED]", &caps[1]),
+            }
+        })
+        .into_owned()
 }
 /// Strip what a terminal renders but a reader never needs: colour codes, the overwritten
 /// part of a progress line, and runs of an identical line. All three are pure volume, and
@@ -1150,7 +1192,21 @@ mod tests {
             assert!(!output.contains("example"), "{output}");
             assert_eq!(redact(&output), output);
         }
-        for benign in ["ordinary log output", "tokenizer_count=5", "secretary=alice"] {
+        for benign in [
+            "ordinary log output",
+            "tokenizer_count=5",
+            "secretary=alice",
+            // Declarations are not assignments of a value.
+            "const CHARS_PER_TOKEN: usize = 3;",
+            "let apiKey: string = load();",
+            "interface X { token: string }",
+            "client_secret: Option<String>",
+            "`apiKey: string` is a declaration",
+            "let token = &caps[2];",
+            "let secret = compute(seed);",
+            // Prose, not an Authorization header.
+            "bearer/basic credentials, selected token formats",
+        ] {
             assert_eq!(redact(benign), benign);
         }
     }
